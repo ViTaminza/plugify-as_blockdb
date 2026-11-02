@@ -2,7 +2,7 @@
 	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
 	"version": "${AS_BLOCKDB_VERSION}",
 	"name": "as_blockdb",
-	"description": "BlockDB integration, ported from the Pisex admin_system module 'BlockDB' ([AS] BlockDB by Pisex): reports every ban to api.blockdb.ru (POST/DELETE /v2/bans with the ApiKey), checks the BlockDB ban list when a player connects and announces returning offenders on a Discord webhook, disconnecting players whose distinct-ban count reached AutoBlockBanCount. HTTP runs over the game server's own libsteam_api.so (ISteamHTTP) without blocking the game thread. Config keys (server_name, ApiKey, AutoBlockBanCount, webhook) are unchanged. Requires the admin_system core.",
+	"description": "BlockDB integration, ported from the Pisex admin_system module 'BlockDB' ([AS] BlockDB by Pisex): reports every ban to api.blockdb.ru (POST/DELETE /v2/bans with the ApiKey), checks the BlockDB ban list when a player connects and announces returning offenders on a Discord webhook, disconnecting players whose distinct-ban count reached AutoBlockBanCount. HTTP runs over the game server's own libsteam_api.so (ISteamHTTP) without blocking the game thread. Config keys (server_name, ApiKey, AutoBlockBanCount, webhook) are unchanged. Pure s2sdk: no pisexcompat, no hudmenu, no local database. Requires the admin_system core.",
 	"author": "Pisex, ported to Plugify",
 	"website": "https://github.com/untrustedmodders/plugify",
 	"license": "GPL-3.0",
@@ -17,11 +17,6 @@
 		{
 			"name": "admin_system",
 			"constraints": ">=1.0.0"
-		},
-		{
-			"name": "hudmenu",
-			"constraints": ">=1.0.0",
-			"optional": true
 		}
 	]
 }

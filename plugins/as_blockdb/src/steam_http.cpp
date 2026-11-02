@@ -1,18 +1,49 @@
 #include "steam_http.hpp"
 
-#include <pisex/output.hpp>
+#include "steam_http_api.hpp"
+#include "steam_url.hpp"
+
+#ifdef AS_BLOCKDB_STEAM_HTTP_TESTING
+#include "steam_http_testing.hpp"
+#endif
+
+#include <plg/plugin.hpp> // plg::Log: the module's own logger (no pisexcompat)
 
 #include <s2sdk/s2sdk.hpp> // GetGameDirectory for the libsteam_api fallback path
 
 #include <dlfcn.h>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace steamhttp {
+
+// Valve's CCallbackBase (steam_api_common.h). Deliberately no virtual destructor: the vtable of
+// the object handed to SteamAPI_RegisterCallResult must start with Run(void*),
+// Run(void*, bool, SteamAPICall_t) and GetCallbackSizeBytes(), and the two data members must sit
+// right after the vptr - that is the binary interface the library was compiled against.
+class CallbackBase {
+public:
+	virtual void Run(void* pvParam) = 0;
+	virtual void Run(void* pvParam, bool bIOFailure, uint64_t hSteamAPICall) = 0;
+	virtual int GetCallbackSizeBytes() = 0;
+
+	enum {
+		k_ECallbackFlagsRegistered = 0x01,
+		k_ECallbackFlagsGameServer = 0x02,
+	};
+	uint8_t m_nCallbackFlags;
+	int32_t m_iCallback;
+
+protected:
+	CallbackBase() : m_nCallbackFlags(0), m_iCallback(0) {}
+	~CallbackBase() = default; // never deleted through this type
+};
+
 namespace {
 
 constexpr char kLogTag[] = "steam_http";
@@ -40,27 +71,6 @@ static_assert(offsetof(HTTPRequestCompleted_t, m_bRequestSuccessful) == 16, "HTT
 static_assert(offsetof(HTTPRequestCompleted_t, m_eStatusCode) == 20, "HTTPRequestCompleted_t layout");
 static_assert(offsetof(HTTPRequestCompleted_t, m_unBodySize) == 24, "HTTPRequestCompleted_t layout");
 
-// Valve's CCallbackBase (steam_api_common.h). Deliberately no virtual destructor: the vtable of
-// the object handed to SteamAPI_RegisterCallResult must start with Run(void*),
-// Run(void*, bool, SteamAPICall_t) and GetCallbackSizeBytes(), and the two data members must sit
-// right after the vptr - that is the binary interface the library was compiled against.
-class CallbackBase {
-public:
-	virtual void Run(void* pvParam) = 0;
-	virtual void Run(void* pvParam, bool bIOFailure, uint64_t hSteamAPICall) = 0;
-	virtual int GetCallbackSizeBytes() = 0;
-
-	enum {
-		k_ECallbackFlagsRegistered = 0x01,
-		k_ECallbackFlagsGameServer = 0x02,
-	};
-	uint8_t m_nCallbackFlags;
-	int32_t m_iCallback;
-
-protected:
-	CallbackBase() : m_nCallbackFlags(0), m_iCallback(0) {}
-	~CallbackBase() = default; // never deleted through this type
-};
 // The C ABI boundary: vptr, then the flags byte and the callback id - the library reads and
 // writes them at these offsets. (offsetof on a polymorphic type is what GCC would warn about;
 // a size check pins the same layout without it.)
@@ -72,27 +82,18 @@ static_assert(sizeof(CallbackBase) == sizeof(void*) + sizeof(CallbackBaseLayoutP
 			  "CallbackBase must be vptr + flags + callback id");
 
 // --- resolved entry points --------------------------------------------------------------------
-struct SteamApi {
-	void* module = nullptr;
-	void* (*getHttp)() = nullptr; // SteamAPI_SteamGameServerHTTP_vNNN
-	uint32_t (*CreateHTTPRequest)(void*, int32_t, const char*) = nullptr;
-	bool (*SetHTTPRequestHeaderValue)(void*, uint32_t, const char*, const char*) = nullptr;
-	bool (*SetHTTPRequestRawPostBody)(void*, uint32_t, const char*, uint8_t*, uint32_t) = nullptr;
-	bool (*SendHTTPRequest)(void*, uint32_t, uint64_t*) = nullptr;
-	bool (*GetHTTPResponseBodySize)(void*, uint32_t, uint32_t*) = nullptr;
-	bool (*GetHTTPResponseBodyData)(void*, uint32_t, uint8_t*, uint32_t) = nullptr;
-	bool (*ReleaseHTTPRequest)(void*, uint32_t) = nullptr;
-	void (*RegisterCallResult)(CallbackBase*, uint64_t) = nullptr;
-	void (*UnregisterCallResult)(CallbackBase*, uint64_t) = nullptr;
-	void* http = nullptr; // ISteamHTTP*
-};
-
 SteamApi g_api;
 bool g_loadFailureLogged = false;
 bool g_symbolFailure = false; // permanent: a missing symbol cannot appear later
+#ifdef AS_BLOCKDB_STEAM_HTTP_TESTING
+bool g_testMode = false;
+#endif
 
 void LogError(std::string_view message) {
-	pisex::ErrorLog("[%s] %.*s", kLogTag, static_cast<int>(message.size()), message.data());
+	if (plg::Log) {
+		plg::Log(std::string("[") + kLogTag + "] " + std::string(message), plg::Severity::Error,
+				 plg::source_location::current());
+	}
 }
 
 template <typename Fn>
@@ -127,6 +128,14 @@ void* OpenSteamApi() {
 }
 
 bool ResolveApi() {
+#ifdef AS_BLOCKDB_STEAM_HTTP_TESTING
+	if (g_testMode) {
+		if (g_api.http == nullptr && g_api.getHttp != nullptr) {
+			g_api.http = g_api.getHttp();
+		}
+		return g_api.http != nullptr;
+	}
+#endif
 	if (g_symbolFailure) {
 		return false;
 	}
@@ -282,7 +291,7 @@ void SendRequest(Method method, const std::string& url, const std::string& autho
 	const uint32_t request =
 		g_api.CreateHTTPRequest(g_api.http, static_cast<int32_t>(method), url.c_str());
 	if (request == 0) {
-		LogError("CreateHTTPRequest failed for " + url);
+		LogError("CreateHTTPRequest failed for " + SafeUrlForLog(url));
 		return;
 	}
 	pending.request = request;
@@ -300,7 +309,7 @@ void SendRequest(Method method, const std::string& url, const std::string& autho
 
 	uint64_t call = 0;
 	if (!g_api.SendHTTPRequest(g_api.http, request, &call)) {
-		LogError("SendHTTPRequest failed for " + url);
+		LogError("SendHTTPRequest failed for " + SafeUrlForLog(url));
 		g_api.ReleaseHTTPRequest(g_api.http, request);
 		return;
 	}
@@ -362,5 +371,24 @@ void Shutdown() {
 		it = g_pending.erase(it);
 	}
 }
+
+#ifdef AS_BLOCKDB_STEAM_HTTP_TESTING
+void SetApiForTests(const SteamApi& api) {
+	g_api = api;
+	g_testMode = true;
+	g_symbolFailure = false;
+	g_loadFailureLogged = false;
+	if (g_api.http == nullptr && g_api.getHttp != nullptr) {
+		g_api.http = g_api.getHttp();
+	}
+}
+
+void ResetApiForTests() {
+	g_testMode = false;
+	g_api = SteamApi{};
+	g_symbolFailure = false;
+	g_loadFailureLogged = false;
+}
+#endif
 
 } // namespace steamhttp
